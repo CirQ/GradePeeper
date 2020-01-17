@@ -1,0 +1,5 @@
+
+module.exports = {
+    cookie_jsessionid: 'JSESSIONID',
+    courseid_interested: ['CID1', 'CID2']
+};
