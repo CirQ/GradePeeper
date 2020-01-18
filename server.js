@@ -2,9 +2,12 @@
 const assert = require('assert')
 
 const cheerio = require('cheerio')
+const qrcode = require('qrcode')
 const qrcodeterminal = require('qrcode-terminal')
 const redis = require('async-redis')
 const superagent = require('superagent')
+const tmp = require('tmp')
+const { FileBox } = require('file-box')
 const { Wechaty, log } = require('wechaty')
 const { MemoryCard } = require('memory-card')
 const { PuppetMock } = require('wechaty-puppet-mock')
@@ -15,22 +18,70 @@ const config = require('./config')
 const client = redis.createClient(config.redis_url)
 
 class SystemProber {
-    constructor(wxid, jsessionid, courses) {
+    constructor(wxid, msger, jsessionid, courses) {
         this.wxid = wxid
+        this.msger = msger
         this.jsessionid = jsessionid
         this.courses = courses
     }
 
-    static async obtain(wxid){
-        const jsessionid = await client.get(`JSESSIONID#${wxid}`)
-        const jid = await this._validate_cookie(jsessionid)
+    static async obtain(wxid, msger){
+        const jid = await client.get(`JSESSIONID#${wxid}`)
         const crs = await client.smembers(`COURSES#${wxid}`)
-        return new SystemProber(wxid, jid, crs)
+        return new SystemProber(wxid, msger, jid, crs)
     }
 
-    static async _validate_cookie(jsessionid) {
-        // todo!!!
-        return jsessionid
+    _refresh_cookie() {
+        this.msger.say('需要重新扫码登陆哦~')
+        superagent
+            .get('https://cas.sustech.edu.cn/cas/login')
+            .set('User-Agent', 'python-requests/2.21.0')
+            .set('Connection', 'keep-alive')
+            .end((err, res) => {
+                const state = /var state = "(.*?)";/.exec(res.text)[1]
+                const content = 'https://open.weixin.qq.com/connect/oauth2/authorize?' +
+                                `appid=wx8839ace7048d181b&response_type=code&scope=snsapi_base&state=${state}&` +
+                                'redirect_uri=https%3A%2F%2Fcas.sustech.edu.cn%2Fcas%2Flogin%3Fwechat%3Dcallback&a=1#wechat_redirect'
+                let path = tmp.tmpNameSync({postfix:'.png'})
+                let cas_tmp = res.headers['set-cookie'][0].split(';')[0]
+                qrcode.toFile(path, content).then( err => {
+                    if(!err){
+                        const fileBox = FileBox.fromFile(path)
+                        this.msger.say(fileBox)
+
+                        let int = setInterval(() => {
+                            const agent = superagent.agent()
+                            agent.get(`https://cas.sustech.edu.cn/cas/login?wechat=check&state=${state}`)
+                                .set('User-Agent', 'python-requests/2.21.0')
+                                .set('Connection', 'keep-alive')
+                                .set('Cookie', cas_tmp)
+                                .end((err, res) => {
+                                    let s = res.text
+                                    const ret = JSON.parse(s.substring(1,s.length-1))
+                                    if(ret.status === 'success') {
+                                        const code = ret.code
+                                        agent.post('https://cas.sustech.edu.cn/cas/login?service=http%3A%2F%2Fgradinfo.sustech.edu.cn%2Fssfw%2Fj_spring_ids_security_check')
+                                        .set('User-Agent', 'python-requests/2.21.0')
+                                        .set('Connection', 'keep-alive')
+                                        .set('Cookie', cas_tmp)
+                                        .send(`status=success&confirmUrl=&wechat=success&state=${state}&code=${code}`)
+                                        .redirects(1)
+                                        .end((err, res) => {
+                                            const jid = res.headers['set-cookie'][0].split(';')[0].split('JSESSIONID=')[1]
+                                            client.set(`JSESSIONID#${this.wxid}`, jid)
+                                            clearInterval(int)
+                                            this.msger.say('登陆成功！重新开始查询吧~')
+                                        })
+                                    }
+                                    else {
+                                        console.log('heartbeating ' + ret.status)
+                                    }
+                                })
+                        }, 5*1000)
+                        setTimeout(() => clearInterval(int), 60*1000)
+                    }
+                })
+            });
     }
 
     async _handleResponse(text) {
@@ -53,7 +104,7 @@ class SystemProber {
         return results
     }
 
-    async probe(msger) {
+    async probe() {
         try {
             var res = await superagent
                 .get('http://gradinfo.sustech.edu.cn/ssfw/pygl/cjgl/cjcx.do')
@@ -62,7 +113,7 @@ class SystemProber {
             if(res.status == 200) {
                 let result = this._handleResponse(res.text)
                 if(this.courses.length) {
-                    msger.say(`Unknown Course [${this.courses}] Remove`)
+                    this.msger.say(`Unknown Course [${this.courses}] Remove`)
                     const key = `COURSES#${this.wxid}`
                     this.courses.forEach(x => client.srem(key, x))
                 }
@@ -73,6 +124,8 @@ class SystemProber {
             }
         } catch (err) {
             console.error('request with error: ' + err)
+            if(err.status == 401)
+                this._refresh_cookie()
         }
         return null
     }
@@ -83,10 +136,13 @@ class SystemProber {
 class WechatyServer {
 
     async _check(fromId, msger) {
-        const pb = await SystemProber.obtain(fromId)
-        var result = await pb.probe(msger)
+        const pb = await SystemProber.obtain(fromId, msger)
+        var result = await pb.probe()
+        if(result.length == 0){
+            msger.say('似乎没有关注课程成绩哦。。')
+            return
+        }
         result.forEach((gitem) => {
-
             if(isNaN(gitem.grade)) {
                 const { name, cid } = gitem;
                 msger.say(`【${name}/${cid}】还没有出分数哦~`)
@@ -98,7 +154,6 @@ class WechatyServer {
                         `折合绩点：${gpa}\n` +
                         `是否及格：${(status==='及格')&&'是' || '否'}`)
             }
-
         });
     }
 
