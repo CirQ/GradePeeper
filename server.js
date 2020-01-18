@@ -3,6 +3,7 @@ const assert = require('assert')
 
 const cheerio = require('cheerio')
 const qrcodeterminal = require('qrcode-terminal')
+const redis = require('async-redis')
 const superagent = require('superagent')
 const { Wechaty, log } = require('wechaty')
 const { MemoryCard } = require('memory-card')
@@ -11,17 +12,20 @@ const { PuppetMock } = require('wechaty-puppet-mock')
 
 const config = require('./config')
 
+const client = redis.createClient(config.redis_url)
 
 class SystemProber {
-    constructor(jsessionid, courses) {
+    constructor(wxid, jsessionid, courses) {
+        this.wxid = wxid
         this.jsessionid = jsessionid
         this.courses = courses
     }
 
-    static async make(jsessionid, courses){
-        const jid = this._validate_cookie(jsessionid)
-        const crs = courses.map(cid => cid.toUpperCase())
-        return new SystemProber(jid, crs)
+    static async obtain(wxid){
+        const jsessionid = await client.get(`JSESSIONID#${wxid}`)
+        const jid = await this._validate_cookie(jsessionid)
+        const crs = await client.smembers(`COURSES#${wxid}`)
+        return new SystemProber(wxid, jid, crs)
     }
 
     static async _validate_cookie(jsessionid) {
@@ -43,19 +47,26 @@ class SystemProber {
                     gpa: +$(this).find(':nth-child(7)').text(),
                     status: $(this).find(':nth-child(8)').text().trim(),
                 })
+                self.courses = self.courses.filter(x => x!==cid)
             }
         })
         return results
     }
 
-    async probe() {
+    async probe(msger) {
         try {
             var res = await superagent
                 .get('http://gradinfo.sustech.edu.cn/ssfw/pygl/cjgl/cjcx.do')
-                .set('Cookie', 'JSESSIONID='+this.jsessionid)
+                .set('Cookie', `JSESSIONID=${this.jsessionid}`)
                 .send();
             if(res.status == 200) {
-                return this._handleResponse(res.text)
+                let result = this._handleResponse(res.text)
+                if(this.courses.length) {
+                    msger.say(`Unknown Course [${this.courses}] Remove`)
+                    const key = `COURSES#${this.wxid}`
+                    this.courses.forEach(x => client.srem(key, x))
+                }
+                return result
             }
             else {
                 console.error('not OK status: ' + res.status)
@@ -71,12 +82,9 @@ class SystemProber {
 
 class WechatyServer {
 
-    async check(fromId, msger){
-        const jsessionid = config.cookie_jsessionid
-        const courses = config.courseid_interested
-
-        const pb = new SystemProber(jsessionid, courses)
-        var result = await pb.probe()
+    async _check(fromId, msger) {
+        const pb = await SystemProber.obtain(fromId)
+        var result = await pb.probe(msger)
         result.forEach((gitem) => {
 
             if(isNaN(gitem.grade)) {
@@ -94,9 +102,56 @@ class WechatyServer {
         });
     }
 
+    async _register(fromId, msger) {
+        const key = `JSESSIONID#${fromId}`
+        const exist = await client.exists(key)
+        if(exist) {
+            msger.say('已经注册过啦！')
+        }
+        else {
+            client.set(key, 'salty')
+            msger.say('注册成功啦！')
+        }
+    }
+
+    async _showall(fromId, msger) {
+        const cset = await client.smembers(`COURSES#${fromId}`)
+        if(cset) {
+            cset.sort()
+            msger.say('已经关注的课程编号：\n' + cset.join('\n'))
+        }
+        else {
+            msger.say('还没有关注任何课程哦~')
+        }
+    }
+
+    async _add(fromId, courseId, msger) {
+        const key = `COURSES#${fromId}`
+        const exist = await client.sismember(key, courseId)
+        if(exist) {
+            msger.say(`已经关注过${courseId}啦！`)
+        }
+        else {
+            client.sadd(key, courseId)
+            msger.say(`成功关注${courseId}啦！`)
+        }
+    }
+    
+    async _drop(fromId, courseId, msger) {
+        const key = `COURSES#${fromId}`
+        const exist = await client.sismember(key, courseId)
+        if(!exist) {
+            msger.say(`还没有关注${courseId}啦！`)
+        }
+        else {
+            client.srem(key, courseId)
+            msger.say(`成功取关${courseId}啦！`)
+        }
+    }
+
+
     async onMessage(msg, payload) {
-        if(payload.toId != this.wxid){
-            // send from myself
+        if(payload.toId != this.wxid){ // send from myself
             assert.equal(payload.fromId, this.wxid)
             return
         }
@@ -104,10 +159,24 @@ class WechatyServer {
             return
 
         const { fromId, text } = payload;
-        switch(text) {
-            case 'mock text test':
-                this.check(fromId, msg)
+        switch(true) {  // https://stackoverflow.com/questions/2896626
+            case /^peek peek peek$/.test(text):
+                this._check(fromId, msg)
                 break;
+            case /^register$/.test(text):
+                this._register(fromId, msg)
+                break
+            case /^showall$/.test(text):
+                this._showall(fromId, msg)
+                break
+            case /^focus [A-Z0-9]+$/i.test(text):
+                var cid = text.split(' ')[1].toUpperCase()
+                this._add(fromId, cid, msg)
+                break
+            case /^loose [A-Z0-9]+$/i.test(text):
+                var cid = text.split(' ')[1].toUpperCase()
+                this._drop(fromId, cid, msg)
+                break
         }
     }
 
@@ -116,7 +185,7 @@ class WechatyServer {
         if(DEFAULT_PUPPET) {
             this.bot = new Wechaty({ name: name })
         }
-        else{
+        else {
             const puppet = new PuppetMock({ memory: new MemoryCard() })
             // const ppp = new
             this.bot = new Wechaty({ name: name, puppet: puppet })
@@ -158,4 +227,7 @@ class WechatyServer {
 new WechatyServer().init()
     .start()
     .then(() => log.info('CheckerBot', 'Checker-Bot Started.'))
-    .catch(err => log.error('CheckerBot', err))
+    .catch(err => {
+        log.error('CheckerBot', err)
+        client.end(true)
+    })

@@ -1,5 +1,4 @@
 
 module.exports = {
-    cookie_jsessionid: 'JSESSIONID',
-    courseid_interested: ['CID1', 'CID2']
+    redis_url: 'REDIS_URL'
 };

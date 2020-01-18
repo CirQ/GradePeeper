@@ -8,8 +8,10 @@
   "author": "cirq",
   "license": "MIT",
   "dependencies": {
+    "async-redis": "^1.1.7",
     "cheerio": "^1.0.0-rc.3",
     "qrcode-terminal": "^0.12.0",
+    "redis": "^2.8.0",
     "superagent": "^5.2.1",
     "wechaty": "^0.28.3",
     "wechaty-puppet": "^0.16.1",
